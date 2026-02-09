@@ -1,0 +1,3 @@
+[theme]
+font = "Fustat:https://fonts.googleapis.com/css2?family=Fustat:wght@300;400&display=swap"
+primaryFont = "Fustat:https://fonts.googleapis.com/css2?family=Fustat:wght@300;400&display=swap"
