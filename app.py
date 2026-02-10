@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 import matplotlib as mpl
 from matplotlib import font_manager as fm
+from pathlib import Path
 
 def _setup_plot_fonts() -> None:
     font_dir = Path(__file__).parent / "assets" / "fonts"
@@ -331,33 +332,119 @@ st.caption("Train a surrogate model on your aero dataset, estimate uncertainty, 
 # Clean, stable sidebar (no controls jumping around)
 with st.sidebar:
     st.header("Help")
-    st.markdown("**Defaults:** Bayesian (B) for ≤8 variables, DE for >8.")
+
+    with st.expander("What should I select as target columns?"):
+        st.write(
+            "Choose the aero outputs you want the model to predict (for example: cd, cl, clf, clr, drag, lift, downforce). "
+            "Avoid selecting design variables such as geometry inputs — those should stay as inputs for prediction and optimisation."
+        )
+
+    with st.expander("What is the group column for?"):
+        st.write(
+            "Use a group column when you have repeated samples from the same run or configuration (for example: Run, Case_ID, Geometry_ID). "
+            "It keeps related rows together when splitting, which helps avoid leakage and gives a fairer test score."
+        )
+
     with st.expander("What is Small data mode?"):
         st.write(
             "Auto-enabled when the dataset is small or has low samples-per-feature. "
-            "It prefers more conservative modelling settings to reduce overfitting."
+            "It uses more conservative modelling settings to reduce overfitting."
         )
+
     with st.expander("What does uncertainty mean?"):
         st.write(
             "Uncertainty comes from a bootstrap ensemble (many retrains on resampled data). "
-            "If your input is far from training data, uncertainty is inflated automatically."
+            "If your input is far from the training data — especially near the edges — uncertainty is typically higher."
         )
+
+    with st.expander("What does risk aversion do in optimisation?"):
+        st.write(
+            "Risk aversion trades a bit of performance for reliability. "
+            "Higher values favour settings where the model is more confident, rather than chasing a potentially fragile optimum."
+        )
+
+    with st.expander("Why does optimisation push variables to the extremes?"):
+        st.write(
+            "Optimisers often find the best score at the boundary unless there’s a reason not to. "
+            "If edge solutions aren’t trustworthy in your dataset, use a higher risk aversion and consider tightening the allowable ranges."
+        )
+
     with st.expander("Bayesian vs DE vs Anneal"):
         st.write(
-            "Bayesian is usually fastest and strongest in low dimensions (≤8). "
-            "DE is more robust for many variables. Anneal is a simpler alternative sometimes useful between the two."
+            "Bayesian is usually quickest and works well in lower dimensions (around ≤8 variables). "
+            "DE is more robust when you have many variables. Anneal is a simpler alternative that can be a useful middle ground."
         )
+    st.divider()
+    st.subheader("Feedback")
+    st.write("If you have any thoughts or suggestions, please leave them here.")
+    st.link_button("Leave feedback", "https://forms.gle/5ct5yMkmoA3jGgUi7")
+
+
+
+SAMPLE_DIR = Path(__file__).resolve().parent / "sample_data"
+
+SAMPLES = {
+    "airfoil": {
+        "label": "NACA 0009 airfoil — XFOIL polar (Re≈50k, α sweep)",
+        "filename": "naca0009_xfoil_re50k_polar.csv",
+        "desc": "Small sample (≈73 cases). Typical targets: Cl, Cd. Feature: Alpha.",
+    },
+    "drivaer": {
+        "label": "DrivAerML+ — geometry + aero coefficients (ConstRef)",
+        "filename": "drivaerml_geo_plus_constref.csv",
+        "desc": "Larger sample (≈484 designs). Typical targets: cd, cl, clf, clr.",
+    },
+}
 
 st.subheader("1) Load data")
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
-if not uploaded:
-    st.info("Upload a CSV to begin.")
-    st.stop()
 
-df_raw = pd.read_csv(uploaded)
-# --- Reset model state when a new dataset is uploaded (prevents stale columns like 'Alpha') ---
+source = st.radio(
+    "Data source",
+    ["Upload CSV", "Try a sample dataset"],
+    horizontal=True,
+)
+
+uploaded = None
+data_name = None
+
+if source == "Try a sample dataset":
+    sample_key = st.selectbox(
+        "Sample dataset",
+        options=list(SAMPLES.keys()),
+        format_func=lambda k: SAMPLES[k]["label"],
+    )
+
+    sample_path = SAMPLE_DIR / SAMPLES[sample_key]["filename"]
+    if not sample_path.exists():
+        st.error(f"Sample file not found: {sample_path}")
+        st.stop()
+
+    df_raw = pd.read_csv(sample_path)
+    data_name = f"sample::{sample_key}"
+
+    st.caption(SAMPLES[sample_key]["desc"])
+    st.download_button(
+        "Download this sample CSV",
+        data=sample_path.read_bytes(),
+        file_name=SAMPLES[sample_key]["filename"],
+        mime="text/csv",
+    )
+
+else:
+    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    if not uploaded:
+        st.info("Upload a CSV to begin, or switch to “Try a sample dataset”.")
+        st.stop()
+
+    df_raw = pd.read_csv(uploaded)
+    data_name = f"upload::{getattr(uploaded, 'name', 'uploaded')}"
+
+# Optional cleanup: drop accidental empty columns (common in CSV exports)
+df_raw = df_raw.loc[:, ~df_raw.columns.astype(str).str.match(r"^Unnamed")]
+
+# --- Reset model state when a new dataset is loaded (upload OR sample) ---
 data_sig = (
-    getattr(uploaded, "name", "uploaded"),
+    data_name,
     int(df_raw.shape[0]),
     int(df_raw.shape[1]),
     tuple(df_raw.columns),
@@ -378,6 +465,7 @@ if prev_sig != data_sig:
         if k.startswith("sl_"):
             del st.session_state[k]
 # -------------------------------------------------------------------
+
 st.write("Preview", df_raw.head())
 
 st.subheader("2) Select targets and optional group split")
@@ -394,19 +482,25 @@ with c1:
     )
 
 exclude_cols = [c for c in [group_col] if c]
-target_suggestions = _auto_target_suggestions(df_raw, exclude=exclude_cols)
+
+numeric_targets = [
+    c for c in df_raw.columns
+    if pd.api.types.is_numeric_dtype(df_raw[c]) and c != group_col
+]
 
 with c2:
-    numeric_targets = [c for c in df_raw.columns if pd.api.types.is_numeric_dtype(df_raw[c]) and c != group_col]
     targets = st.multiselect(
         "Target columns (outputs to predict)",
         options=numeric_targets,
-        default=[c for c in target_suggestions if c in numeric_targets][:2],
+        default=[],  # always manual
+        placeholder="Choose one or more aero outputs (e.g., cd, cl, clf, drag, lift...)",
     )
 
+# ✅ Keep the manual-selection requirement, but only AFTER showing suggestions
 if not targets:
-    st.warning("Select at least one target column.")
+    st.warning("Select at least one target output to train the model.")
     st.stop()
+
 
 # Determine numeric feature cols (excluding targets/group)
 drop_cols = set(targets)
@@ -720,13 +814,19 @@ with tab_opt:
             )
             risk = st.slider(
                 "Risk aversion (penalise uncertainty)",
-                0.0, 3.0, 0.5, 0.1,
+                0.0, 3.0, 1.0, 0.1,
                 help=(
                     "Penalises uncertain predictions, nudging the optimiser towards ‘safer’ regions of the data. "
                     "0 = fastest (mean-only). 0.5–1.5 is a sensible range. "
                     "Go higher only if you really want conservative solutions."
                 ),
             )
+            edge_buffer_pct = st.slider(
+                "Avoid range edges (buffer %)",
+                0.0, 10.0, 5.0, 0.5,
+                help="Optimiser bounds are shrunk by this % on each side to avoid edge-of-range regions."
+            )
+
 
 
         opt_cfg = OptimisationConfig(
@@ -751,8 +851,25 @@ with tab_opt:
             st.session_state.opt_res = None
 
         if run_opt:
-            bounds = {f: res.feature_ranges[f] for f in opt_vars}
             base = dict(res.baseline_params)
+
+            def _shrink_bounds(lo: float, hi: float, pct: float) -> tuple[float, float]:
+                if hi <= lo:
+                    return lo, hi
+                span = hi - lo
+                d = (pct / 100.0) * span
+                lo2, hi2 = lo + d, hi - d
+                # safety: don’t invert
+                if hi2 <= lo2:
+                    return lo, hi
+                return lo2, hi2
+
+            bounds = {}
+            for f in opt_vars:
+                lo, hi = res.feature_ranges[f]
+                lo2, hi2 = _shrink_bounds(float(lo), float(hi), float(edge_buffer_pct))
+                bounds[f] = (lo2, hi2)
+
 
             need_unc = opt_cfg.risk_aversion > 0.0
             label, obj_fn = _build_objective(
